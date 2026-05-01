@@ -149,6 +149,84 @@ class AgentConfig:
 # Model Variants
 # ============================================================
 
+def agent_debug() -> AgentConfig:
+    """
+    Debug config for testing.
+    
+    Minimal model for rapid iteration (~100K params).
+    """
+    return AgentConfig(
+        vocab_size=1000,
+        dim=64,
+        n_heads=4,
+        n_kv_heads=2,
+        max_seq_len=128,
+        max_loop_iters=4,
+        prelude_layers=1,
+        coda_layers=1,
+        attn_type="gqa",
+        n_experts=4,
+        n_shared_experts=1,
+        n_experts_per_tok=2,
+        expert_dim=64,
+        lora_rank=4,
+    )
+
+
+def agent_tiny() -> AgentConfig:
+    """
+    Tiny config for quick experiments.
+    
+    ~10M parameter model for rapid prototyping.
+    """
+    return AgentConfig(
+        vocab_size=10000,
+        dim=256,
+        n_heads=8,
+        n_kv_heads=2,
+        max_seq_len=512,
+        max_loop_iters=8,
+        prelude_layers=1,
+        coda_layers=1,
+        attn_type="mla",
+        kv_lora_rank=64,
+        q_lora_rank=128,
+        qk_rope_head_dim=16,
+        qk_nope_head_dim=32,
+        v_head_dim=32,
+        n_experts=16,
+        n_shared_experts=1,
+        n_experts_per_tok=2,
+        expert_dim=256,
+        lora_rank=8,
+    )
+
+
+def agent_small() -> AgentConfig:
+    """Alias for agent_1b."""
+    return agent_1b()
+
+
+def agent_medium() -> AgentConfig:
+    """Alias for agent_3b."""
+    return agent_3b()
+
+
+def agent_large() -> AgentConfig:
+    """Alias for agent_10b."""
+    return agent_10b()
+
+
+def agent_xl() -> AgentConfig:
+    """Alias for agent_50b."""
+    return agent_50b()
+
+
+def agent_xxl() -> AgentConfig:
+    """Alias for agent_100b."""
+    return agent_100b()
+
+
 def agent_1b() -> AgentConfig:
     """
     1B parameter config.

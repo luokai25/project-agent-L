@@ -4,18 +4,8 @@ Recurrent block components for Agent L.
 This module implements:
 - LoRAAdapter: Depth-wise LoRA per loop iteration
 - LTIInjection: Linear Time-Invariant injection for stability
-- ACTHalting: Adaptive Computation Time halting (Graves 2016)
-- RecurrentBlock: Core looped transformer block
-
-Key properties:
-- Depth extrapolation: train on T loops, test on T+k for harder problems
-- Variable compute: ACT halting allocates more loops to harder tokens
-- Stability: LTI injection guarantees spectral radius < 1
-
-References:
-[1] Graves "Adaptive Computation Time for RNNs" arXiv 2016
-[2] Saunshi et al. "Reasoning with Latent Thoughts" ICLR 2025
-[3] Bae et al. "LoRA" ICLR 2024
+- ACTHalting: Adaptive Computation Time halting mechanism
+- RecurrentBlock: The core looped transformer block
 """
 
 from typing import Optional
@@ -26,188 +16,142 @@ import torch.nn.functional as F
 from .config import AgentConfig
 from .layers import RMSNorm, loop_index_embedding
 from .attention import GQAttention, MLAttention
-from .moe import MoEFFN, DenseFFN
+from .moe import MoEFFN
 
-
-# ============================================================
-# LoRA Depth Adapter
-# ============================================================
 
 class LoRAAdapter(nn.Module):
     """
-    Depth-wise LoRA adaptation for recurrent block [3].
-    
-    Pure weight-tying (identical weights every loop) limits expressiveness.
-    Fully distinct weights per loop eliminate parameter savings.
-    
-    This adapter sits in between: shared low-rank projections with a
-    small per-loop scale vector that shifts the effective transformation
-    at each depth without significant parameter overhead.
-    
-    delta(x, t) = down(x) * scale[t] @ B
-    
-    References:
-        [3] Bae et al., ICLR 2024 - LoRA
+    Depth-wise LoRA adaptation for the recurrent block (Bae et al., 2024).
+
+    Pure weight-tying (identical weights every loop) limits expressiveness;
+    fully distinct weights per loop eliminate parameter savings. This adapter
+    sits in between: shared low-rank projections with a per-loop scale vector.
+
+    delta(x, t) = (down(x) * scale[t]) @ B
     """
-    
+
     def __init__(self, dim: int, rank: int, max_loops: int):
-        """
-        Args:
-            dim: Model hidden dimension
-            rank: Low-rank bottleneck dimension
-            max_loops: Maximum loop iterations (embedding table size)
-        """
         super().__init__()
-        self.down = nn.Linear(dim, rank, bias=False)
-        self.B = nn.Parameter(torch.randn(rank, dim) * 0.02)
-        self.scale = nn.Embedding(max_loops, rank)
-    
+        self.down = nn.Linear(dim, rank, bias=False)  # shared A: dim → rank
+        self.B = nn.Parameter(torch.randn(rank, dim) * 0.02)  # shared B: rank → dim
+        self.scale = nn.Embedding(max_loops, rank)  # per-loop element-wise scale
+
     def forward(self, x: torch.Tensor, loop_t: int) -> torch.Tensor:
         """
         Args:
-            x: Input of shape (B, T, dim)
-            loop_t: Current loop index (0-based)
-        
+            x: Input tensor of shape (B, T, dim)
+            loop_t: Current loop index for scale lookup
+
         Returns:
             Delta tensor of shape (B, T, dim) to add to block output
         """
-        # Clamp for depth extrapolation (reuse last scale beyond training max)
+        # Clamp for depth extrapolation at inference
         max_t = self.scale.num_embeddings - 1
-        t_idx = min(loop_t, max_t)
-        
-        s = self.scale(torch.tensor([t_idx], device=x.device))  # (1, rank)
-        down = self.down(x)  # (B, T, rank)
-        return (down * s).unsqueeze(1) @ self.B.unsqueeze(0)  # (B, T, dim)
+        t_idx = loop_t if loop_t <= max_t else max_t
+        s = self.scale.weight[t_idx]  # (rank,)
+        return self.down(x) * s @ self.B
 
-
-# ============================================================
-# LTI Injection (Stability)
-# ============================================================
 
 class LTIInjection(nn.Module):
     """
-    Linear Time-Invariant injection for stable recurrence.
-    
-    The recurrent update: h_{t+1} = A·h_t + B·e + transformer_out
-    
-    For stability, we need ||A|| < 1 (spectral radius < 1) to prevent
-    unbounded growth over many loop iterations.
-    
-    Solution: Parameterize A as A = alpha * tanh(W) / ||W||
-    This guarantees ||A|| <= alpha < 1 when alpha < 1.
-    
-    The encoded input e is injected at every step to keep the original
-    input signal alive across arbitrary loop depth, preventing drift.
+    Linear Time-Invariant injection for stable recurrent updates.
+
+    Implements h_{t+1} = A·h_t + B·e + transformer_out with guaranteed
+    spectral radius ρ(A) < 1 via log-space parameterization.
+
+    This prevents hidden state drift across arbitrary loop depth, keeping
+    the original input signal e alive throughout recurrence.
     """
-    
-    def __init__(self, dim: int, alpha: float = 0.9):
-        """
-        Args:
-            dim: Model hidden dimension
-            alpha: Spectral radius upper bound (< 1 for stability)
-        """
+
+    def __init__(self, dim: int):
         super().__init__()
-        self.alpha = alpha
-        self.W_h = nn.Linear(dim, dim, bias=False)
-        self.W_e = nn.Linear(dim, dim, bias=False)
-    
+        # Log-space parameters for numerical stability
+        self.log_dt = nn.Parameter(torch.zeros(()))
+        self.log_A = nn.Parameter(torch.zeros(dim))
+
+    def get_A(self) -> torch.Tensor:
+        """
+        Compute A = exp(-exp(log_dt + log_A)) with ρ(A) < 1 guaranteed.
+        """
+        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+
     def forward(
-        self, 
-        h: torch.Tensor, 
-        e: torch.Tensor, 
-        delta: torch.Tensor
+        self,
+        h: torch.Tensor,
+        e: torch.Tensor,
+        transformer_out: torch.Tensor,
     ) -> torch.Tensor:
         """
+        Compute h_{t+1} = A·h_t + B·e + transformer_out.
+
         Args:
-            h: Current hidden state, shape (B, T, dim)
-            e: Encoded input (frozen), shape (B, T, dim)
-            delta: Transformer output to inject, shape (B, T, dim)
-        
+            h: Current hidden state (B, T, dim)
+            e: Encoded input from Prelude, frozen across loops (B, T, dim)
+            transformer_out: Output of recurrent TransformerBlock (B, T, dim)
+
         Returns:
-            Updated hidden state, shape (B, T, dim)
+            Updated hidden state (B, T, dim)
         """
-        # Normalize W to control spectral radius
-        W = self.W_h.weight
-        W_norm = W.norm()
-        if W_norm > 0:
-            A = self.alpha * torch.tanh(W / W_norm)
-        else:
-            A = self.alpha * torch.tanh(W)
-        
-        # Apply A via functional linear (use normalized weight)
-        h_update = F.linear(h, A, None)
-        
-        return h_update + self.W_e(e) + delta
+        A = self.get_A()
+        B = 1.0 - A  # Ensures unity gain on the e signal
+        return A * h + B * e + transformer_out
 
-
-# ============================================================
-# ACT Halting (Graves 2016)
-# ============================================================
 
 class ACTHalting(nn.Module):
     """
-    Adaptive Computation Time halting [1].
-    
-    Each position accumulates a halting probability across loop iterations.
-    When cumulative probability >= threshold, that position "halts" and
-    stops contributing to further iterations.
-    
-    The final output is a weighted sum of hidden states across iterations,
-    where weights reflect when each position converged.
-    
-    ACT enables variable compute per position within a batch - harder tokens
-    get more iterations, easier tokens halt early.
-    
-    References:
-        [1] Graves, arXiv 2016 - "Adaptive Computation Time for RNNs"
+    Adaptive Computation Time halting mechanism (Graves, 2016).
+
+    Learns a per-position halting probability at each loop iteration. Positions
+    where the hidden state has converged stop accumulating updates, while
+    positions still being refined continue. This enables variable compute per
+    token within the same batch.
+
+    Also makes the model Turing-complete under certain assumptions about
+    transformer block expressiveness.
     """
-    
+
     def __init__(self, dim: int):
         super().__init__()
-        self.halt = nn.Linear(dim, 1, bias=False)
-    
+        self.halt = nn.Linear(dim, 1)
+
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """
+        Predict per-position halting probability from hidden state.
+
         Args:
-            h: Hidden state, shape (B, T, dim)
-        
+            h: Hidden state of shape (B, T, dim)
+
         Returns:
-            Halting probability per position, shape (B, T)
+            Halting probability of shape (B, T), values in (0, 1)
         """
         return torch.sigmoid(self.halt(h)).squeeze(-1)
 
 
-# ============================================================
-# Transformer Block (single layer)
-# ============================================================
-
 class TransformerBlock(nn.Module):
     """
-    Single transformer block: Attention + FFN.
-    
-    Can use either:
-    - MoE FFN (for recurrent block)
-    - Dense FFN (for prelude/coda)
+    Standard transformer block: Attention + FFN with residual connections.
+
+    When use_moe=True, uses MoE FFN; otherwise uses simple SwiGLU FFN.
     """
-    
+
     def __init__(self, cfg: AgentConfig, use_moe: bool = False):
         super().__init__()
-        
-        # Attention
-        if cfg.attn_type == "mla":
-            self.attn = MLAttention(cfg)
-        else:
-            self.attn = GQAttention(cfg)
-        
-        # FFN
+        self.attn = GQAttention(cfg) if cfg.attn_type == "gqa" else MLAttention(cfg)
+        self.attn_norm = RMSNorm(cfg.dim)
+
         if use_moe:
             self.ffn = MoEFFN(cfg)
         else:
-            self.ffn = DenseFFN(cfg.dim)
-        
-        self.norm1 = RMSNorm(cfg.dim)
-        self.norm2 = RMSNorm(cfg.dim)
-    
+            # Simple SwiGLU FFN for prelude/coda
+            hidden_dim = cfg.dim * 4
+            self.ffn = nn.Sequential(
+                nn.Linear(cfg.dim, hidden_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, cfg.dim, bias=False),
+            )
+
+        self.ffn_norm = RMSNorm(cfg.dim)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -217,58 +161,50 @@ class TransformerBlock(nn.Module):
         cache_key: str = "default",
     ) -> torch.Tensor:
         """
-        Pre-norm architecture: norm → attention → residual → norm → ffn → residual
+        Args:
+            x: Input of shape (B, T, dim)
+            freqs_cis: RoPE frequencies
+            mask: Causal mask or None
+            kv_cache: KV cache dict
+            cache_key: Cache key for this block
+
+        Returns:
+            Output of shape (B, T, dim)
         """
-        # Attention
-        x = x + self.attn(self.norm1(x), freqs_cis, mask, kv_cache, cache_key)
-        # FFN
-        x = x + self.ffn(self.norm2(x))
+        # Attention with residual
+        x = x + self.attn(self.attn_norm(x), freqs_cis, mask, kv_cache, cache_key)
+        # FFN with residual
+        x = x + self.ffn(self.ffn_norm(x))
         return x
 
 
-# ============================================================
-# Recurrent Block (looped transformer)
-# ============================================================
-
 class RecurrentBlock(nn.Module):
     """
-    Core recurrent block with ACT halting [2].
-    
-    At each loop iteration t:
-    1. Loop-index embedding: inject sinusoidal signal for depth awareness
-    2. TransformerBlock: compute attention + MoE FFN
-    3. LoRAAdapter: apply depth-wise delta
-    4. LTIInjection: stable update h = A·h + B·e + transformer_out
-    5. ACTHalting: accumulate halting probabilities
-    
-    The encoded input e (from Prelude) is injected at every step to prevent
-    hidden state drift across arbitrary depth.
-    
-    Properties:
-    - Same weights, more loops → deeper reasoning (no parameter growth)
-    - Depth extrapolation: train on T, test on T+k
-    - Variable compute: ACT allocates more iterations to harder tokens
-    
-    References:
-        [2] Saunshi et al., ICLR 2025 - "Reasoning with Latent Thoughts"
+    The core recurrent block of Agent L — a single TransformerBlock looped T times.
+
+    At each loop iteration t, the hidden state h is updated via:
+        1. loop_index_embedding: Inject sinusoidal loop-index signal into h
+        2. TransformerBlock: Compute attention + MoE FFN on normalized (h + e)
+        3. LoRAAdapter: Apply depth-wise LoRA delta to transformer output
+        4. LTIInjection: Stable update h = A·h + B·e + transformer_out
+        5. ACTHalting: Accumulate halting probabilities; converged positions stop
+
+    The encoded input e (output of Prelude) is injected at every step to keep
+    the original input signal alive, preventing drift.
+
+    More loop iterations at inference = deeper reasoning chains (depth extrapolation).
     """
-    
+
     def __init__(self, cfg: AgentConfig):
         super().__init__()
         self.cfg = cfg
-        
-        # Core transformer block with MoE
         self.block = TransformerBlock(cfg, use_moe=True)
-        
-        # Stability and adaptation
         self.injection = LTIInjection(cfg.dim)
         self.act = ACTHalting(cfg.dim)
         self.lora = LoRAAdapter(cfg.dim, cfg.lora_rank, cfg.max_loop_iters)
         self.norm = RMSNorm(cfg.dim)
-        
-        # Fraction of channels receiving loop-index embedding
-        self.loop_dim = cfg.dim // 8
-    
+        self.loop_dim = cfg.dim // 8  # fraction of channels for loop-index embedding
+
     def forward(
         self,
         h: torch.Tensor,
@@ -279,47 +215,46 @@ class RecurrentBlock(nn.Module):
         kv_cache: Optional[dict] = None,
     ) -> torch.Tensor:
         """
-        Run recurrent loop with ACT early exit.
-        
+        Run the recurrent loop for up to n_loops iterations with ACT early exit.
+
         Args:
-            h: Initial hidden state from Prelude, shape (B, T, dim)
-            e: Encoded input frozen for injection, shape (B, T, dim)
+            h: Initial hidden state from Prelude (B, T, dim)
+            e: Encoded input frozen for injection each step (B, T, dim)
             freqs_cis: Precomputed RoPE frequencies
             mask: Additive causal mask or None
-            n_loops: Number of loop iterations (default: cfg.max_loop_iters)
-            kv_cache: Cache dict for each loop iteration
-        
+            n_loops: Number of loop iterations; defaults to cfg.max_loop_iters
+            kv_cache: Cache dict passed to inner TransformerBlock
+
         Returns:
-            ACT-weighted sum of hidden states, shape (B, T, dim)
+            ACT-weighted sum of hidden states across iterations (B, T, dim)
         """
         n_loops = n_loops or self.cfg.max_loop_iters
         B, T, D = h.shape
-        
-        # ACT state
+
         halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
         cumulative_p = torch.zeros(B, T, device=h.device)
         h_out = torch.zeros_like(h)
-        
+
         for t in range(n_loops):
-            # 1. Loop-index embedding
+            # Inject loop-index signal
             h_loop = loop_index_embedding(h, t, self.loop_dim)
-            
-            # 2. Transformer block
+
+            # Transformer block on (h + e)
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
             trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
-            
-            # 3. LoRA depth adapter
+
+            # Apply LoRA adapter
             trans_out = trans_out + self.lora(trans_out, t)
-            
-            # 4. LTI-stable update
+
+            # LTI-stable hidden state update
             h = self.injection(h, e, trans_out)
-            
-            # 5. ACT halting
+
+            # Compute halting probability
             p = self.act(h)  # (B, T)
             still_running = ~halted
-            
-            # ACT remainder trick: assign remaining probability mass as final weight
+
+            # ACT remainder trick: assign remaining probability mass at threshold
             remainder = (1.0 - cumulative_p).clamp(min=0)
             weight = torch.where(
                 cumulative_p + p >= self.cfg.act_threshold,
@@ -327,14 +262,16 @@ class RecurrentBlock(nn.Module):
                 p,
             )
             weight = weight * still_running.float()
+
+            # Accumulate weighted hidden state
             h_out = h_out + weight.unsqueeze(-1) * h
-            
-            # Update state
+
+            # Update cumulative probability and halt status
             cumulative_p = cumulative_p + p * still_running.float()
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
-            
-            # Early exit only when no KV cache (cache requires all depths to run)
+
+            # Short-circuit only when no KV cache (cache needs all loop keys populated)
             if halted.all() and kv_cache is None:
                 break
-        
+
         return h_out

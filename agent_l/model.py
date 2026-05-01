@@ -1,9 +1,9 @@
 """
 Agent L: Recurrent-Depth Transformer Language Model.
 
-A research implementation combining proven components from published papers:
+A theoretical reconstruction of the Claude Mythos architecture as a
+Recurrent-Depth Transformer (RDT), implementing:
 
-Architecture:
     Input tokens
          ↓
     [Prelude]          — prelude_layers standard transformer blocks, run once
@@ -16,27 +16,12 @@ Architecture:
     Output logits
 
 Key properties:
-- Same weights, more loops → deeper reasoning (no parameter growth)
+- Same weights, more loops → deeper reasoning, no parameter growth
 - Depth extrapolation: train on N loops, test on N+k loops (emergent)
 - ACT halting: variable compute per position within a batch
-- MoE FFN in recurrent block: breadth across domains
-- LTI-stable injection: spectral radius < 1 guaranteed
-- Supports both GQA and MLA attention
-
-Provenance:
-- Looped transformers: Saunshi et al., ICLR 2025
-- MLA: DeepSeek-V2, 2024
-- DeepSeekMoE: Dai et al., ACL 2024
-- ACT: Graves, 2016
-
-IMPORTANT: This is NOT Claude's architecture. Anthropic has not published
-Claude's architecture. This is a novel combination of proven components.
-
-References:
-[1] Saunshi et al. "Reasoning with Latent Thoughts" ICLR 2025
-[2] DeepSeek-AI "DeepSeek-V2" arXiv 2024
-[3] Dai et al. "DeepSeekMoE" ACL 2024
-[4] Graves "Adaptive Computation Time for RNNs" arXiv 2016
+- MoE FFN in the recurrent block: breadth across domains
+- LTI-stable injection: spectral radius < 1 guaranteed by construction
+- Supports both GQA and MLA attention (set via cfg.attn_type)
 """
 
 from typing import Optional
@@ -45,97 +30,115 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import AgentConfig
-from .layers import RMSNorm, precompute_rope_freqs, causal_mask
-from .recurrent import RecurrentBlock, TransformerBlock
+from .layers import RMSNorm, precompute_rope_freqs
+from .recurrent import TransformerBlock, RecurrentBlock
 
 
 class AgentL(nn.Module):
     """
-    Agent L Recurrent-Depth Transformer.
-    
-    Combines published research components into a unified architecture:
-    
-    - Prelude: Standard transformer layers for initial encoding
-    - Recurrent Block: Looped transformer with MoE + ACT halting
-    - Coda: Standard transformer layers for final processing
-    
-    The recurrent block can be run with more iterations at inference time
-    for harder problems (depth extrapolation, proven in [1]).
-    
-    Example:
-        >>> from agent_l import AgentL, agent_3b
-        >>> cfg = agent_3b()
-        >>> model = AgentL(cfg)
-        >>> 
-        >>> # Forward pass
-        >>> tokens = torch.randint(0, cfg.vocab_size, (1, 32))
-        >>> logits = model(tokens, n_loops=8)
-        >>> 
-        >>> # Generation
-        >>> output = model.generate(tokens, max_new_tokens=64)
+    Agent L — Recurrent-Depth Transformer language model.
+
+    Implements the hypothesized Claude Mythos architecture as a Recurrent-Depth
+    Transformer (RDT). The model divides computation into three functional blocks:
+
+        Input tokens
+             ↓
+        [Prelude]          — prelude_layers standard transformer blocks, run once
+             ↓
+        [Recurrent Block]  — one transformer block looped T times with input injection
+             ↑_______↓     h_{t+1} = A·h_t + B·e + Transformer(h_t, e)
+             ↓
+        [Coda]             — coda_layers standard transformer blocks, run once
+             ↓
+        Output logits
+
+    Key properties:
+    - Same weights, more loops → deeper reasoning, no parameter growth
+    - Depth extrapolation: train on N loops, test on N+k loops (emergent)
+    - ACT halting: variable compute per position within a batch
+    - MoE FFN in the recurrent block: breadth across domains
+    - LTI-stable injection: spectral radius < 1 guaranteed by construction
+    - Supports both GQA and MLA attention (set via cfg.attn_type)
     """
-    
+
     def __init__(self, cfg: AgentConfig):
         """
         Args:
-            cfg: AgentConfig specifying all hyperparameters
+            cfg: AgentConfig specifying all architecture hyperparameters
         """
         super().__init__()
         self.cfg = cfg
-        
+
         # Token embedding
         self.embed = nn.Embedding(cfg.vocab_size, cfg.dim)
-        
-        # RoPE frequencies
-        # GQA uses full head_dim for RoPE; MLA uses qk_rope_head_dim
+
+        # Precompute RoPE frequencies
+        # GQA uses full head_dim for RoPE; MLA uses only qk_rope_head_dim
         freqs = precompute_rope_freqs(
-            cfg.dim // cfg.n_heads, 
-            cfg.max_seq_len, 
-            cfg.rope_theta
+            cfg.dim // cfg.n_heads, cfg.max_seq_len, cfg.rope_theta
         )
         self.register_buffer("freqs_cis", freqs)
-        
+
         freqs_mla = precompute_rope_freqs(
-            cfg.qk_rope_head_dim, 
-            cfg.max_seq_len, 
-            cfg.rope_theta
+            cfg.qk_rope_head_dim, cfg.max_seq_len, cfg.rope_theta
         )
         self.register_buffer("freqs_cis_mla", freqs_mla)
-        
-        # Prelude: standard transformer blocks
-        self.prelude = nn.ModuleList([
-            TransformerBlock(cfg, use_moe=False) 
-            for _ in range(cfg.prelude_layers)
-        ])
-        
-        # Recurrent block (looped)
+
+        # Prelude: standard transformer blocks before the loop
+        self.prelude = nn.ModuleList(
+            [TransformerBlock(cfg, use_moe=False) for _ in range(cfg.prelude_layers)]
+        )
+
+        # Recurrent block: looped T times
         self.recurrent = RecurrentBlock(cfg)
-        
-        # Coda: standard transformer blocks
-        self.coda = nn.ModuleList([
-            TransformerBlock(cfg, use_moe=False) 
-            for _ in range(cfg.coda_layers)
-        ])
-        
-        # Output
+
+        # Coda: standard transformer blocks after the loop
+        self.coda = nn.ModuleList(
+            [TransformerBlock(cfg, use_moe=False) for _ in range(cfg.coda_layers)]
+        )
+
+        # Final normalization and output projection
         self.norm = RMSNorm(cfg.dim)
         self.head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
-        
-        # Weight tying (reduces parameters, improves generalization)
+
+        # Weight tying between embedding and output head
         self.head.weight = self.embed.weight
-        
+
         self._init_weights()
-    
+
     def _init_weights(self) -> None:
-        """Initialize weights with N(0, 0.02) - standard for transformers."""
+        """Initialize all linear and embedding weights with N(0, 0.02)."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
-    
+
+    @staticmethod
+    def _causal_mask(
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Build an additive causal mask: 0 on and below diagonal, -inf above.
+
+        Args:
+            seq_len: Sequence length
+            device: Target device
+            dtype: Tensor dtype (must match activation dtype for correct addition)
+
+        Returns:
+            Tensor of shape (1, 1, seq_len, seq_len) broadcastable over (B, H, T, S)
+        """
+        mask = torch.full(
+            (1, 1, seq_len, seq_len),
+            float("-inf"),
+            device=device,
+            dtype=dtype,
+        )
+        return torch.triu(mask, diagonal=1)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -144,47 +147,52 @@ class AgentL(nn.Module):
         start_pos: int = 0,
     ) -> torch.Tensor:
         """
-        Forward pass: Prelude → Recurrent Block → Coda.
-        
+        Forward pass through Prelude → Recurrent Block → Coda.
+
         Args:
             input_ids: Token indices of shape (B, T)
-            n_loops: Recurrent loop depth (default: cfg.max_loop_iters)
-                Can be increased at inference for deeper reasoning
-            kv_cache: Dict for autoregressive KV caching
-            start_pos: Position offset for RoPE during incremental decoding
-        
+            n_loops: Recurrent loop depth; defaults to cfg.max_loop_iters.
+                     Increase at inference to extrapolate to harder problems.
+            kv_cache: Dict mutated in-place for autoregressive KV caching;
+                      pass an empty dict {} and reuse across decode steps
+            start_pos: Index of the first token in input_ids within the full
+                       sequence; used to select correct RoPE frequencies
+                       during incremental decoding
+
         Returns:
             Logits of shape (B, T, vocab_size)
         """
         T = input_ids.shape[1]
         device = input_ids.device
-        
-        # Embed tokens
+
+        # Token embedding
         x = self.embed(input_ids)
-        
-        # Select RoPE frequencies based on attention type
+
+        # Select correct RoPE frequencies
         freqs_cis = (
             self.freqs_cis_mla if self.cfg.attn_type == "mla" else self.freqs_cis
         )[start_pos : start_pos + T]
-        
-        # Causal mask (only for prefill, not single-token decode)
-        mask = causal_mask(T, device, x.dtype) if T > 1 else None
-        
-        # Prelude
+
+        # Build causal mask (only for sequences > 1 token)
+        mask = self._causal_mask(T, device, x.dtype) if T > 1 else None
+
+        # Prelude: standard transformer layers
         for i, layer in enumerate(self.prelude):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
-        
-        # Recurrent block
-        e = x  # Encoded input, frozen for injection each loop
+
+        # Encoded input frozen for injection every loop
+        e = x
+
+        # Recurrent block: looped T times with ACT halting
         x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
-        
-        # Coda
+
+        # Coda: standard transformer layers
         for i, layer in enumerate(self.coda):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
-        
+
         # Output logits
         return self.head(self.norm(x))
-    
+
     @torch.no_grad()
     def generate(
         self,
@@ -195,86 +203,84 @@ class AgentL(nn.Module):
         top_k: int = 50,
     ) -> torch.Tensor:
         """
-        Autoregressive generation with KV caching.
-        
-        On step 0: process full prompt
-        On subsequent steps: process only last token, retrieve K/V from cache
-        
+        Autoregressive token generation with KV caching.
+
+        On step 0 the full prompt is processed. On subsequent steps only the
+        last generated token is passed, with all previous keys and values
+        retrieved from kv_cache. This keeps decode cost proportional to one
+        token per step rather than the full growing sequence.
+
+        n_loops can be set higher than training value for depth extrapolation
+        to harder problems at inference time.
+
         Args:
-            input_ids: Prompt tokens, shape (B, T)
+            input_ids: Prompt token indices of shape (B, T)
             max_new_tokens: Number of tokens to generate
-            n_loops: Recurrent depth per decode step
-            temperature: Sampling temperature (lower = more greedy)
-            top_k: Restrict to top-K logits (0 = disabled)
-        
+            n_loops: Recurrent loop depth for each decode step
+            temperature: Softmax temperature; lower = more greedy
+            top_k: Restrict sampling to top-K logits (0 = disabled)
+
         Returns:
-            Generated tokens, shape (B, T + max_new_tokens)
+            Token indices of shape (B, T + max_new_tokens)
         """
         kv_cache: dict = {}
         prompt_len = input_ids.shape[1]
-        
+
         for step in range(max_new_tokens):
-            # Prefill on first step, then decode single token
             if step == 0:
+                # First step: process full prompt
                 cur_ids = input_ids
                 start_pos = 0
             else:
+                # Subsequent steps: process only last token
                 cur_ids = input_ids[:, -1:]
                 start_pos = prompt_len + step - 1
-            
-            # Forward pass
+
+            # Forward pass with KV cache
             logits = self.forward(
-                cur_ids, 
-                n_loops=n_loops, 
-                kv_cache=kv_cache, 
-                start_pos=start_pos
+                cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos
             )
-            
-            # Sample next token
+
+            # Sample next token from last position
             logits = logits[:, -1, :] / temperature
-            
+
             if top_k > 0:
                 v, _ = logits.topk(top_k)
                 logits[logits < v[:, -1:]] = float("-inf")
-            
+
             probs = F.softmax(logits, dim=-1)
             next_tok = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_tok], dim=1)
-        
+
         return input_ids
-    
+
     def count_parameters(self) -> dict:
-        """Count total and active parameters."""
+        """
+        Count model parameters by category.
+
+        Returns:
+            Dict with 'total', 'embed', 'prelude', 'recurrent', 'coda', 'head'
+        """
         total = sum(p.numel() for p in self.parameters())
-        
-        # Estimate active parameters for MoE
-        cfg = self.cfg
-        
-        # Embedding + output head
-        embed_params = cfg.vocab_size * cfg.dim
-        
-        # Prelude + Coda (dense)
-        prelude_params = cfg.prelude_layers * (
-            # Attention (approximate for MLA)
-            cfg.dim * cfg.dim * 2 +  # rough estimate
-            cfg.dim * cfg.dim * 4    # FFN
-        )
-        coda_params = cfg.coda_layers * prelude_params / cfg.prelude_layers
-        
-        # Recurrent block
-        # - Attention (shared)
-        recurrent_attn = cfg.dim * cfg.dim * 2
-        # - MoE: only topk experts active
-        expert_params = cfg.dim * cfg.expert_dim * 2 + cfg.expert_dim * cfg.dim
-        routed_active = cfg.n_experts_per_tok * expert_params
-        shared_active = cfg.n_shared_experts * expert_params * cfg.n_experts_per_tok
-        moe_active = routed_active + shared_active
-        
-        active = int(embed_params + prelude_params + coda_params + recurrent_attn + moe_active)
-        
+        embed = sum(p.numel() for p in self.embed.parameters())
+        prelude = sum(p.numel() for p in self.prelude.parameters())
+        recurrent = sum(p.numel() for p in self.recurrent.parameters())
+        coda = sum(p.numel() for p in self.coda.parameters())
+        head = sum(p.numel() for p in self.head.parameters())
+
         return {
             "total": total,
-            "active_estimate": active,
-            "total_billions": total / 1e9,
-            "active_billions": active / 1e9,
+            "embed": embed,
+            "prelude": prelude,
+            "recurrent": recurrent,
+            "coda": coda,
+            "head": head,
         }
+
+    def get_spectral_radius(self) -> float:
+        """
+        Get the maximum spectral radius of LTI injection A matrix.
+        Should be < 1 for stability.
+        """
+        A = self.recurrent.injection.get_A()
+        return A.max().item()
