@@ -1,32 +1,36 @@
 # Agent L
 
-A Recurrent-Depth Transformer implementation based on the Claude Mythos architecture hypothesis.
+A Recurrent-Depth Transformer implementation based on published research.
 
-## Architecture
-
-Agent L implements a **Recurrent-Depth Transformer (RDT)** - a transformer architecture where a subset of layers is recycled and run through multiple times per forward pass. This enables deeper reasoning without parameter explosion.
+## Architecture Overview
 
 ```
-Input tokens
-     ↓
-[Prelude]          — standard transformer layers, run once
-     ↓
-[Recurrent Block]  — one transformer block looped T times with input injection
-     ↑_______↓     h_{t+1} = A·h_t + B·e + Transformer(h_t, e)
-     ↓
-[Coda]             — standard transformer layers, run once
-     ↓
-Output logits
+Input → [Prelude] → [Recurrent Block × T loops] → [Coda] → Output
+                          ↓
+              MLA + DeepSeekMoE + ACT Halting
 ```
 
-## Key Features
+## Provenance: What's Proven vs. Hypothesized
 
-- **Recurrent Depth**: Same weights, more loops → deeper reasoning, no parameter growth
-- **Depth Extrapolation**: Train on N loops, test on N+k loops (emergent capability)
-- **ACT Halting**: Variable compute per position within a batch
-- **MoE FFN**: Mixture of Experts in the recurrent block for breadth across domains
-- **LTI-Stable Injection**: Spectral radius < 1 guaranteed by construction
-- **Dual Attention**: Supports both GQA and MLA (Multi-Latent Attention)
+| Component | Source | Status |
+|-----------|--------|--------|
+| **Looped Transformers** | Saunshi et al., ICLR 2025 [1] | ✅ Proven - k×L ≈ kL layers on reasoning |
+| **Multi-Latent Attention (MLA)** | DeepSeek-V2, 2024 [2] | ✅ Proven - 93% KV cache reduction |
+| **DeepSeekMoE** | DeepSeekMoE, ACL 2024 [3] | ✅ Proven - fine-grained + shared experts |
+| **ACT Halting** | Graves, 2016 [4] | ✅ Proven - differentiable adaptive compute |
+| **Loop-index embedding** | Saunshi et al., 2025 [1] | ✅ Proven - distinguishes loop iterations |
+| **LTI Injection** | OpenMythos [5] | ⚠️ Hypothesized - stability mechanism |
+| **Combined architecture** | This implementation | ⚠️ Novel combination of proven parts |
+
+**Important**: This is NOT Claude's architecture. Anthropic has not published Claude's architecture. This is a research implementation combining proven components from published papers.
+
+## References
+
+1. Saunshi et al. "Reasoning with Latent Thoughts: On the Power of Looped Transformers" ICLR 2025
+2. DeepSeek-AI "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model" arXiv 2024
+3. Dai et al. "DeepSeekMoE: Towards Ultimate Expert Specialization in MoE LLMs" ACL 2024
+4. Graves "Adaptive Computation Time for Recurrent Neural Networks" arXiv 2016
+5. Gomez "OpenMythos" GitHub 2024 - hypothesis reconstruction
 
 ## Installation
 
@@ -37,77 +41,68 @@ pip install -e .
 ## Quick Start
 
 ```python
-import torch
-from agent_l import AgentL, AgentConfig
+from agent_l import AgentL, AgentConfig, agent_3b
 
-# Create a small model for testing
-cfg = AgentConfig(
-    vocab_size=1000,
-    dim=256,
-    n_heads=8,
-    max_seq_len=128,
-    max_loop_iters=4,
-    prelude_layers=1,
-    coda_layers=1,
-    n_experts=8,
-    n_shared_experts=1,
-    n_experts_per_tok=2,
-    expert_dim=64,
-    lora_rank=8,
-    attn_type="mla",
-)
-
+# Use pre-configured model
+cfg = agent_3b()
 model = AgentL(cfg)
 
-# Forward pass
-input_ids = torch.randint(0, cfg.vocab_size, (2, 16))
-logits = model(input_ids, n_loops=4)
-print(f"Logits shape: {logits.shape}")
+# Run forward pass
+import torch
+tokens = torch.randint(0, cfg.vocab_size, (1, 32))
+logits = model(tokens, n_loops=8)
 
 # Generate
-output = model.generate(input_ids, max_new_tokens=8, n_loops=8)
-print(f"Generated shape: {output.shape}")
+output = model.generate(tokens, max_new_tokens=64, n_loops=8)
 ```
 
-## Configuration
+## Key Properties
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `vocab_size` | Token vocabulary size | 32000 |
-| `dim` | Model hidden dimension | 2048 |
-| `n_heads` | Number of query attention heads | 16 |
-| `n_kv_heads` | Number of key/value heads (GQA) | 4 |
-| `max_seq_len` | Maximum sequence length | 4096 |
-| `max_loop_iters` | Default recurrent loop depth | 16 |
-| `prelude_layers` | Layers before the loop | 2 |
-| `coda_layers` | Layers after the loop | 2 |
-| `attn_type` | "gqa" or "mla" | "mla" |
-| `n_experts` | Number of routed experts | 64 |
-| `n_shared_experts` | Always-active shared experts | 2 |
-| `n_experts_per_tok` | Top-K experts per token | 4 |
-| `expert_dim` | Expert hidden dimension | 512 |
-| `act_threshold` | ACT halting threshold | 0.99 |
-| `lora_rank` | Depth-wise LoRA rank | 16 |
+### Depth Extrapolation (Saunshi et al.)
+- Train with T loops, test with T+k loops for harder problems
+- Recurrence-equivalence exponent φ ≈ 0.46
 
-## Model Variants
+### MLA Efficiency (DeepSeek-V2)
+- KV cache compressed to latent vector
+- 93% cache reduction, 5.76× throughput gain
 
-Pre-configured model sizes:
+### DeepSeekMoE Routing
+- Fine-grained experts: split N into m×N sub-experts, activate m×K
+- Shared experts: Ks always-active for common knowledge
+- 16B model matches LLaMA2-7B with 40% compute
 
-- `agent_1b()` - 1B parameters (dim=2048, 64 experts)
-- `agent_3b()` - 3B parameters (dim=3072, 64 experts)
-- `agent_10b()` - 10B parameters (dim=4096, 128 experts)
-- `agent_50b()` - 50B parameters (dim=6144, 256 experts)
-- `agent_100b()` - 100B parameters (dim=8192, 256 experts, 1M context)
+### ACT Halting (Graves)
+- Per-position halting probabilities
+- Variable compute per token
 
-## Research Background
+## Project Structure
 
-This implementation is based on the hypothesis that Claude Mythos uses a Recurrent-Depth Transformer architecture. Key papers:
+```
+agent_l/
+├── __init__.py          # Package exports
+├── config.py            # Configuration + model variants
+├── model.py             # AgentL main model
+├── layers.py            # RMSNorm, RoPE, loop-index embedding
+├── attention.py         # GQA + MLA (Multi-Latent Attention)
+├── moe.py               # DeepSeekMoE (fine-grained + shared)
+└── recurrent.py         # RecurrentBlock, LTI injection, ACT halting
+```
 
-- [Loop, Think, & Generalize](https://arxiv.org/pdf/2604.07822) - Implicit reasoning in RDTs
-- [Parcae: Scaling Laws for Stable Looped Language Models](https://arxiv.org/abs/2604.12946)
-- [Reasoning with Latent Thoughts](https://arxiv.org/abs/2502.17416) - Power of looped transformers
-- [DeepSeek-V2](https://arxiv.org/abs/2401.06066) - MoE with shared experts
+## Training
+
+This is an architecture skeleton with random weights. To make it useful:
+
+1. Pretrain on large text corpus (see `training/`)
+2. Apply MLA + MoE efficiency techniques
+3. Fine-tune with SFT + RLHF
 
 ## License
 
-MIT License
+MIT
+
+## Acknowledgments
+
+- DeepSeek-AI for MLA and DeepSeekMoE architectures
+- Saunshi et al. for looped transformer research
+- Alex Graves for ACT
+- Kye Gomez for OpenMythos hypothesis
