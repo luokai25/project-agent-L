@@ -5,6 +5,7 @@ Implementation of DeepSeekMoE architecture with:
 - Fine-grained expert segmentation
 - Shared experts for common knowledge
 - Aux-loss-free load balancing (DeepSeek-V3)
+- Vectorized computation for efficiency
 
 Key results from DeepSeekMoE:
 - 2B model matches GShard 2.9B with 1.5× fewer parameters
@@ -86,6 +87,9 @@ class MoEFFN(nn.Module):
        shifts the routing selection without affecting gradients. Underused
        experts get higher bias, encouraging selection without gradient penalty.
     
+    4. Vectorized computation:
+       Uses einsum for batched expert computation, avoiding slow Python loops.
+    
     References:
         [1] Dai et al., ACL 2024 - DeepSeekMoE
         [2] DeepSeek-V3 Technical Report, 2024
@@ -96,6 +100,8 @@ class MoEFFN(nn.Module):
         self.n_experts = cfg.n_experts
         self.n_shared = cfg.n_shared_experts
         self.topk = cfg.n_experts_per_tok
+        self.dim = cfg.dim
+        self.expert_dim = cfg.expert_dim
         
         # Router: produces logits for each expert
         self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
@@ -105,11 +111,17 @@ class MoEFFN(nn.Module):
         # affecting the gating weights in the gradient
         self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
         
-        # Routed experts (fine-grained)
-        self.routed_experts = nn.ModuleList([
-            Expert(cfg.dim, cfg.expert_dim) 
-            for _ in range(cfg.n_experts)
-        ])
+        # Fused expert weights for efficient vectorized computation
+        # Shape: (n_experts, dim, expert_dim)
+        self.up_proj = nn.Parameter(torch.empty(cfg.n_experts, cfg.dim, cfg.expert_dim))
+        self.gate_proj = nn.Parameter(torch.empty(cfg.n_experts, cfg.dim, cfg.expert_dim))
+        self.down_proj = nn.Parameter(torch.empty(cfg.n_experts, cfg.expert_dim, cfg.dim))
+        
+        # Initialize fused weights
+        for i in range(cfg.n_experts):
+            nn.init.normal_(self.up_proj[i], std=0.02)
+            nn.init.normal_(self.gate_proj[i], std=0.02)
+            nn.init.zeros_(self.down_proj[i])
         
         # Shared experts (always active)
         # Each shared expert is larger: handles common knowledge
@@ -120,46 +132,96 @@ class MoEFFN(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
+        Vectorized forward pass using einsum for batched expert computation.
+        
         Args:
             x: Input of shape (B, T, dim)
         
         Returns:
             Output of shape (B, T, dim)
-            Shared expert outputs summed on top of weighted routed outputs
         """
         B, T, D = x.shape
-        flat = x.view(B * T, D)  # Flatten for token-level routing
+        flat = x.view(B * T, D)  # (N, D) where N = B*T
+        N = flat.shape[0]
         
         # ========== Routing ==========
         # Unbiased logits for gating weights
-        logits = self.router(flat)  # (B*T, n_experts)
+        logits = self.router(flat)  # (N, n_experts)
         scores = F.softmax(logits, dim=-1)
         
         # Bias-shifted logits for selection (aux-loss-free load balancing)
+        topk_scores, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)
+        topk_scores = F.softmax(topk_scores, dim=-1)  # Renormalize
+        
+        # ========== Vectorized Expert Computation ==========
+        # Gather weights for selected experts
+        # up_proj[topk_idx]: (N, K, D, E) where E = expert_dim
+        up_weights = self.up_proj[topk_idx]
+        gate_weights = self.gate_proj[topk_idx]
+        down_weights = self.down_proj[topk_idx]
+        
+        # Expand input for each top-k position
+        x_expanded = flat.unsqueeze(1).expand(-1, self.topk, -1)  # (N, K, D)
+        
+        # Compute expert outputs via batched einsum
+        # x @ W: (N, K, D) @ (N, K, D, E) -> (N, K, E)
+        up_out = torch.einsum('nkd,nkde->nke', x_expanded, up_weights)
+        gate_out = torch.einsum('nkd,nkde->nke', x_expanded, gate_weights)
+        hidden = F.silu(gate_out) * up_out  # SwiGLU: gate * up
+        
+        # hidden @ W_down: (N, K, E) @ (N, K, E, D) -> (N, K, D)
+        expert_out = torch.einsum('nke,nked->nkd', hidden, down_weights)
+        
+        # Weight by routing scores and sum over top-k
+        out = (expert_out * topk_scores.unsqueeze(-1)).sum(dim=1)  # (N, D)
+        
+        # ========== Shared Experts ==========
+        # Always active for every token
+        for shared in self.shared_experts:
+            out = out + shared(flat)
+        
+        return out.view(B, T, D)
+    
+    def forward_python_loop(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Legacy forward pass using Python loops (slower but more explicit).
+        Useful for debugging and verification.
+        
+        Args:
+            x: Input of shape (B, T, dim)
+        
+        Returns:
+            Output of shape (B, T, dim)
+        """
+        B, T, D = x.shape
+        flat = x.view(B * T, D)
+        
+        # Routing
+        logits = self.router(flat)
+        scores = F.softmax(logits, dim=-1)
         _, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)
+        topk_scores = scores.gather(-1, topk_idx)
+        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)
         
-        # Gather scores for selected experts
-        topk_scores = scores.gather(-1, topk_idx)  # (B*T, topk)
-        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # Renormalize
-        
-        # ========== Routed Expert Dispatch ==========
+        # Dispatch using F.linear with fused weights
         out = torch.zeros_like(flat)
-        
-        # Dispatch each selected expert
         for i in range(self.topk):
-            expert_ids = topk_idx[:, i]  # (B*T,) - which expert for each token
-            token_scores = topk_scores[:, i].unsqueeze(-1)  # (B*T, 1)
-            
-            # Process each expert
+            expert_ids = topk_idx[:, i]
+            token_scores = topk_scores[:, i].unsqueeze(-1)
             for eid in range(self.n_experts):
                 mask = expert_ids == eid
                 if not mask.any():
                     continue
-                # Apply expert to matching tokens
-                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+                expert_input = flat[mask]
+                # F.linear expects weight shape (out_features, in_features)
+                # Our weights are (dim, expert_dim), need transpose
+                up_out = F.linear(expert_input, self.up_proj[eid].T)
+                gate_out = F.linear(expert_input, self.gate_proj[eid].T)
+                hidden = F.silu(gate_out) * up_out
+                expert_out = F.linear(hidden, self.down_proj[eid].T)
+                out[mask] += token_scores[mask] * expert_out
         
-        # ========== Shared Experts ==========
-        # Always active for every token
+        # Shared experts
         for shared in self.shared_experts:
             out = out + shared(flat)
         
